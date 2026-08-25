@@ -63,7 +63,8 @@ A PyInstaller spec (`fox.spec`) is included:
 
 ```
 py -m pip install pyinstaller
-py -m PyInstaller fox.spec
+py -m PyInstaller --clean --onefile --windowed --add-data "fox.ico;." --noconsole --icon="fox.ico" fox.py
+
 ```
 
 The output executable is written to `dist\fox.exe`.
