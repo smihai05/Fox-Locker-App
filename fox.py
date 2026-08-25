@@ -1,12 +1,15 @@
 import ctypes
 import hashlib
+import io
 import os
 import secrets
+import shutil
 import subprocess
 import sys
-import tempfile
+import tempfile 
 import threading
 import tkinter as tk
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -23,7 +26,11 @@ try:
 except ModuleNotFoundError:
     pystray = None
 
-from PIL import Image, ImageDraw
+try:
+    from PIL import Image, ImageDraw
+except ModuleNotFoundError:
+    Image = None
+    ImageDraw = None
 
 
 # ============================================================
@@ -33,7 +40,7 @@ from PIL import Image, ImageDraw
 APP_NAME = "FOX"
 
 MAGIC = b"FOXLOCK1"
-HEADER_VERSION = 1
+HEADER_VERSION = 2
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -41,6 +48,15 @@ HINT_LEN = 512
 
 KEY_LEN = 32
 PBKDF2_ROUNDS = 600_000
+
+# Entry types stored in header version 2+. Version 1 files predate this
+# byte and are always treated as ENTRY_FILE for backward compatibility.
+ENTRY_FILE = 0
+ENTRY_FOLDER = 1
+
+# Locked folders are stored as a single encrypted archive file next to
+# where the original folder used to be, using this suffix.
+FOLDER_SUFFIX = ".foxfolder"
 
 
 # ============================================================
@@ -105,6 +121,12 @@ def ensure_admin():
         )
 
         root.destroy()
+
+    else:
+
+        # An elevated copy of FOX is now starting; this process must not
+        # continue on or it would leave two instances of FOX running.
+        sys.exit(0)
 
 
 # ============================================================
@@ -206,6 +228,127 @@ def unpack_hint(data: bytes) -> str:
 
 
 # ============================================================
+# HEADER PARSING
+# ============================================================
+
+# Bytes needed after the version byte(s): salt + nonce + hint.
+FIXED_HEADER_SIZE = (
+    SALT_SIZE
+    + NONCE_SIZE
+    + HINT_LEN
+)
+
+
+def build_locked_blob(
+    entry_type: int,
+    salt: bytes,
+    nonce: bytes,
+    hint_data: bytes,
+    encrypted: bytes
+) -> bytes:
+
+    return (
+        MAGIC
+        + bytes([HEADER_VERSION])
+        + bytes([entry_type])
+        + salt
+        + nonce
+        + hint_data
+        + encrypted
+    )
+
+
+def parse_locked_file(blob: bytes):
+    """Validate and split a FOX blob into (entry_type, salt, nonce, hint_data, encrypted)."""
+
+    if not blob.startswith(MAGIC):
+
+        raise ValueError(
+            "This is not a FOX locked file."
+        )
+
+    offset = len(MAGIC)
+
+    if len(blob) < offset + 1:
+
+        raise ValueError(
+            "File is corrupted or truncated."
+        )
+
+    version = blob[offset]
+
+    offset += 1
+
+    if version == 1:
+
+        # Legacy format: no entry-type byte, files only.
+        entry_type = ENTRY_FILE
+
+    elif version == 2:
+
+        if len(blob) < offset + 1:
+
+            raise ValueError(
+                "File is corrupted or truncated."
+            )
+
+        entry_type = blob[offset]
+
+        offset += 1
+
+    else:
+
+        raise ValueError(
+            "Unsupported FOX file version."
+        )
+
+    if len(blob) < offset + FIXED_HEADER_SIZE:
+
+        raise ValueError(
+            "File is corrupted or truncated."
+        )
+
+    salt = blob[
+        offset:
+        offset + SALT_SIZE
+    ]
+
+    offset += SALT_SIZE
+
+    nonce = blob[
+        offset:
+        offset + NONCE_SIZE
+    ]
+
+    offset += NONCE_SIZE
+
+    hint_data = blob[
+        offset:
+        offset + HINT_LEN
+    ]
+
+    offset += HINT_LEN
+
+    encrypted = blob[
+        offset:
+    ]
+
+    return entry_type, salt, nonce, hint_data, encrypted
+
+
+def read_header_info(path: Path):
+    """Returns (entry_type, hint) for a locked file/folder without decrypting it."""
+
+    blob = path.read_bytes()
+
+    entry_type, _salt, _nonce, hint_data, _encrypted = parse_locked_file(
+        blob
+    )
+
+    return entry_type, unpack_hint(hint_data)
+
+
+# ============================================================
 # FILE OPERATIONS
 # ============================================================
 
@@ -253,6 +396,12 @@ def atomic_replace(
 
 def is_locked(path: Path):
 
+    if path.is_dir():
+
+        # A plain directory is never itself "locked" - a locked folder
+        # exists on disk as a single .foxfolder archive file instead.
+        return False
+
     try:
 
         with path.open("rb") as file:
@@ -295,17 +444,12 @@ def encrypt_file(
         nonce
     )
 
-    hint_data = pack_hint(
-        hint
-    )
-
-    blob = (
-        MAGIC
-        + bytes([HEADER_VERSION])
-        + salt
-        + nonce
-        + hint_data
-        + encrypted
+    blob = build_locked_blob(
+        ENTRY_FILE,
+        salt,
+        nonce,
+        pack_hint(hint),
+        encrypted
     )
 
     atomic_replace(
@@ -314,56 +458,199 @@ def encrypt_file(
     )
 
 
-def decrypt_file(
-    path: Path,
-    password: str
+def zip_folder(folder: Path) -> bytes:
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(
+        buffer,
+        "w",
+        zipfile.ZIP_DEFLATED
+    ) as archive:
+
+        for item in sorted(folder.rglob("*")):
+
+            arcname = item.relative_to(
+                folder
+            ).as_posix()
+
+            if item.is_dir():
+
+                # Preserve empty subdirectories.
+                archive.writestr(
+                    arcname + "/",
+                    ""
+                )
+
+            else:
+
+                archive.write(
+                    item,
+                    arcname
+                )
+
+    return buffer.getvalue()
+
+
+def unzip_folder(
+    data: bytes,
+    dest: Path
 ):
 
-    blob = path.read_bytes()
+    with zipfile.ZipFile(
+        io.BytesIO(data)
+    ) as archive:
 
-    if not blob.startswith(MAGIC):
+        dest_root = dest.resolve()
 
-        raise ValueError(
-            "This is not a FOX locked file."
+        for name in archive.namelist():
+
+            member_path = (
+                dest / name
+            ).resolve()
+
+            if member_path != dest_root and dest_root not in member_path.parents:
+
+                raise ValueError(
+                    "Archive contains unsafe paths."
+                )
+
+        dest.mkdir(
+            parents=True
         )
 
-    offset = len(MAGIC)
-
-    version = blob[offset]
-
-    if version != HEADER_VERSION:
-
-        raise ValueError(
-            "Unsupported FOX file version."
+        archive.extractall(
+            dest
         )
 
-    offset += 1
 
-    salt = blob[
-        offset:
-        offset + SALT_SIZE
-    ]
+def encrypt_folder(
+    folder: Path,
+    password: str,
+    hint: str = ""
+) -> Path:
 
-    offset += SALT_SIZE
+    locked_path = folder.with_name(
+        folder.name + FOLDER_SUFFIX
+    )
 
-    nonce = blob[
-        offset:
-        offset + NONCE_SIZE
-    ]
+    if locked_path.exists():
 
-    offset += NONCE_SIZE
+        raise ValueError(
+            f"'{locked_path.name}' already exists next to this folder."
+        )
 
-    # Skip password hint.
-    offset += HINT_LEN
+    archive_data = zip_folder(
+        folder
+    )
 
-    encrypted = blob[
-        offset:
-    ]
+    salt = secrets.token_bytes(
+        SALT_SIZE
+    )
+
+    nonce = secrets.token_bytes(
+        NONCE_SIZE
+    )
 
     key = derive_key(
         password,
         salt
     )
+
+    encrypted = encrypt_payload(
+        archive_data,
+        key,
+        nonce
+    )
+
+    blob = build_locked_blob(
+        ENTRY_FOLDER,
+        salt,
+        nonce,
+        pack_hint(hint),
+        encrypted
+    )
+
+    atomic_replace(
+        locked_path,
+        blob
+    )
+
+    try:
+
+        shutil.rmtree(folder)
+
+    except OSError as exc:
+
+        raise RuntimeError(
+            f"Folder was encrypted to '{locked_path.name}', but the original "
+            f"folder could not be fully removed and may still contain "
+            f"unprotected files: {exc}"
+        ) from exc
+
+    return locked_path
+
+
+def unlock_path(
+    path: Path,
+    password: str
+) -> Path:
+    """Decrypts a locked FOX file or folder in place.
+
+    Returns the resulting path - unchanged for files, or the restored
+    folder path (which differs from `path`) for folders.
+    """
+
+    blob = path.read_bytes()
+
+    entry_type, salt, nonce, hint_data, encrypted = parse_locked_file(
+        blob
+    )
+
+    key = derive_key(
+        password,
+        salt
+    )
+
+    if entry_type == ENTRY_FOLDER:
+
+        archive_data = decrypt_payload(
+            encrypted,
+            key,
+            nonce
+        )
+
+        original_name = path.name[
+            :-len(FOLDER_SUFFIX)
+        ] if path.name.endswith(FOLDER_SUFFIX) else path.stem
+
+        dest = path.with_name(
+            original_name
+        )
+
+        if dest.exists():
+
+            raise ValueError(
+                f"Cannot restore folder: '{original_name}' already exists."
+            )
+
+        unzip_folder(
+            archive_data,
+            dest
+        )
+
+        try:
+
+            path.unlink()
+
+        except OSError as exc:
+
+            raise RuntimeError(
+                f"Folder restored to '{dest.name}', but the locked archive "
+                f"file could not be removed: {exc}"
+            ) from exc
+
+        return dest
 
     decrypted = decrypt_payload(
         encrypted,
@@ -376,40 +663,16 @@ def decrypt_file(
         decrypted
     )
 
+    return path
+
 
 def read_hint(path: Path):
 
-    blob = path.read_bytes()
-
-    if not blob.startswith(MAGIC):
-
-        raise ValueError(
-            "This is not a FOX locked file."
-        )
-
-    offset = len(MAGIC)
-
-    version = blob[offset]
-
-    if version != HEADER_VERSION:
-
-        raise ValueError(
-            "Unsupported FOX file version."
-        )
-
-    offset += 1
-
-    offset += SALT_SIZE
-    offset += NONCE_SIZE
-
-    hint_data = blob[
-        offset:
-        offset + HINT_LEN
-    ]
-
-    return unpack_hint(
-        hint_data
+    _entry_type, hint = read_header_info(
+        path
     )
+
+    return hint
 
 
 # ============================================================
@@ -504,8 +767,6 @@ class FoxApp(tk.Tk):
         )
 
         self.tray_icon = None
-
-        self.closing_to_tray = False
 
         self.protocol(
             "WM_DELETE_WINDOW",
@@ -667,6 +928,11 @@ class FoxApp(tk.Tk):
         menu.add_command(
             label="Select file",
             command=self.select_file
+        )
+
+        menu.add_command(
+            label="Select folder",
+            command=self.select_folder
         )
 
         menu.add_command(
@@ -871,7 +1137,7 @@ class FoxApp(tk.Tk):
 
             row,
 
-            text="SELECT",
+            text="SELECT FILE",
 
             style="Fox.TButton",
 
@@ -882,6 +1148,21 @@ class FoxApp(tk.Tk):
             side="left",
 
             padx=10
+        )
+
+        ttk.Button(
+
+            row,
+
+            text="SELECT FOLDER",
+
+            style="Fox.TButton",
+
+            command=self.select_folder
+
+        ).pack(
+
+            side="left"
         )
 
         tk.Label(
@@ -978,7 +1259,8 @@ class FoxApp(tk.Tk):
 
             text=(
 
-                "FOX encrypts the selected file in place.\n\n"
+                "FOX encrypts the selected file in place, or locks a whole "
+                "folder into a single protected archive.\n\n"
 
                 "Passwords may contain letters, numbers and symbols.\n"
 
@@ -1061,7 +1343,7 @@ class FoxApp(tk.Tk):
 
     def start_tray(self):
 
-        if pystray is None:
+        if pystray is None or Image is None:
             return
 
         image = create_tray_icon()
@@ -1118,6 +1400,13 @@ class FoxApp(tk.Tk):
 
 
     def minimize_to_tray(self):
+
+        if self.tray_icon is None:
+
+            # No tray icon is running, so hiding the window would make
+            # FOX unreachable. Exit instead of vanishing silently.
+            self.exit_application()
+            return
 
         self.withdraw()
 
@@ -1207,7 +1496,14 @@ class FoxApp(tk.Tk):
             except Exception:
                 pass
 
-        self.destroy()
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+        # Guarantee the process actually terminates instead of lingering
+        # in Task Manager (e.g. a stuck tray backend thread).
+        os._exit(0)
 
 
     # ========================================================
@@ -1222,12 +1518,12 @@ class FoxApp(tk.Tk):
 
             filetypes=[
                 (
-                    "Text files",
-                    "*.txt"
-                ),
-                (
                     "All files",
                     "*"
+                ),
+                (
+                    "Text files",
+                    "*.txt"
                 )
             ]
         )
@@ -1245,9 +1541,11 @@ class FoxApp(tk.Tk):
 
         if is_locked(target):
 
+            entry_type = ENTRY_FILE
+
             try:
 
-                hint = read_hint(
+                entry_type, hint = read_header_info(
                     target
                 )
 
@@ -1263,9 +1561,17 @@ class FoxApp(tk.Tk):
                     "Hint: unavailable"
                 )
 
-            self.set_status(
-                "TARGET SELECTED // LOCKED"
-            )
+            if entry_type == ENTRY_FOLDER:
+
+                self.set_status(
+                    "TARGET SELECTED // LOCKED FOLDER"
+                )
+
+            else:
+
+                self.set_status(
+                    "TARGET SELECTED // LOCKED FILE"
+                )
 
         else:
 
@@ -1276,6 +1582,32 @@ class FoxApp(tk.Tk):
             self.set_status(
                 "TARGET SELECTED // UNLOCKED"
             )
+
+
+    def select_folder(self):
+
+        path = filedialog.askdirectory(
+            title="Select target folder"
+        )
+
+        if not path:
+            return
+
+        target = Path(
+            path
+        )
+
+        self.selected_file.set(
+            str(target)
+        )
+
+        self.hint_status.set(
+            "Hint: none"
+        )
+
+        self.set_status(
+            "TARGET SELECTED // FOLDER (UNLOCKED)"
+        )
 
 
     def get_path(self):
@@ -1444,7 +1776,9 @@ class FoxApp(tk.Tk):
         if not path:
             return
 
-        if is_locked(path):
+        is_folder = path.is_dir()
+
+        if not is_folder and is_locked(path):
 
             messagebox.showinfo(
 
@@ -1471,15 +1805,34 @@ class FoxApp(tk.Tk):
         try:
 
             self.set_status(
+
+                "ENCRYPTING FOLDER // PLEASE WAIT"
+                if is_folder else
                 "ENCRYPTING // PLEASE WAIT"
             )
 
             self.update_idletasks()
 
-            encrypt_file(
-                path,
-                password,
-                hint
+            if is_folder:
+
+                result_path = encrypt_folder(
+                    path,
+                    password,
+                    hint
+                )
+
+            else:
+
+                encrypt_file(
+                    path,
+                    password,
+                    hint
+                )
+
+                result_path = path
+
+            self.selected_file.set(
+                str(result_path)
             )
 
             self.hint_status.set(
@@ -1496,7 +1849,7 @@ class FoxApp(tk.Tk):
 
                 "FOX // LOCK",
 
-                f"File locked successfully:\n\n{path}"
+                f"{'Folder' if is_folder else 'File'} locked successfully:\n\n{result_path}"
             )
 
         except Exception as exc:
@@ -1587,9 +1940,13 @@ class FoxApp(tk.Tk):
 
             self.update_idletasks()
 
-            decrypt_file(
+            restored_path = unlock_path(
                 path,
                 password
+            )
+
+            self.selected_file.set(
+                str(restored_path)
             )
 
             self.hint_status.set(
@@ -1597,17 +1954,17 @@ class FoxApp(tk.Tk):
             )
 
             self.set_status(
-                "UNLOCKED // FILE RESTORED"
+                "UNLOCKED // RESTORED"
             )
 
             messagebox.showinfo(
 
                 "FOX // UNLOCK",
 
-                "File unlocked successfully."
+                f"Unlocked successfully:\n\n{restored_path}"
             )
 
-        except Exception:
+        except ValueError as exc:
 
             self.set_status(
 
@@ -1618,7 +1975,20 @@ class FoxApp(tk.Tk):
 
                 "FOX // ACCESS DENIED",
 
-                "Wrong password or corrupted file."
+                str(exc)
+            )
+
+        except Exception as exc:
+
+            self.set_status(
+                "ERROR // UNLOCK FAILED"
+            )
+
+            messagebox.showerror(
+
+                "FOX // ERROR",
+
+                str(exc)
             )
 
 
@@ -1664,46 +2034,13 @@ class FoxApp(tk.Tk):
 
             blob = path.read_bytes()
 
-            offset = len(MAGIC)
-
-            version = blob[offset]
-
-            if version != HEADER_VERSION:
-
-                raise ValueError(
-                    "Unsupported FOX file version."
-                )
-
-            offset += 1
-
-            salt = blob[
-                offset:
-                offset + SALT_SIZE
-            ]
-
-            offset += SALT_SIZE
-
-            nonce = blob[
-                offset:
-                offset + NONCE_SIZE
-            ]
-
-            offset += NONCE_SIZE
-
-            hint_data = blob[
-                offset:
-                offset + HINT_LEN
-            ]
+            entry_type, salt, nonce, hint_data, encrypted = parse_locked_file(
+                blob
+            )
 
             old_hint = unpack_hint(
                 hint_data
             )
-
-            offset += HINT_LEN
-
-            encrypted = blob[
-                offset:
-            ]
 
             old_key = derive_key(
                 old_password,
@@ -1765,23 +2102,14 @@ class FoxApp(tk.Tk):
             )
 
 
-            new_blob = (
-
-                MAGIC
-
-                + bytes([
-                    HEADER_VERSION
-                ])
-
-                + new_salt
-
-                + new_nonce
-
-                + pack_hint(
+            new_blob = build_locked_blob(
+                entry_type,
+                new_salt,
+                new_nonce,
+                pack_hint(
                     new_hint
-                )
-
-                + new_encrypted
+                ),
+                new_encrypted
             )
 
 
@@ -1855,7 +2183,7 @@ class FoxApp(tk.Tk):
 
             "FOX // DELETE PASSWORD",
 
-            "This will completely decrypt the file.\n\n"
+            "This will completely decrypt the file or folder.\n\n"
 
             "The password and password hint will be removed.\n\n"
 
@@ -1877,11 +2205,15 @@ class FoxApp(tk.Tk):
 
         try:
 
-            decrypt_file(
+            restored_path = unlock_path(
 
                 path,
 
                 password
+            )
+
+            self.selected_file.set(
+                str(restored_path)
             )
 
             self.hint_status.set(
@@ -1891,7 +2223,7 @@ class FoxApp(tk.Tk):
             self.set_status(
 
                 "PASSWORD REMOVED // "
-                "FILE UNLOCKED"
+                "UNLOCKED"
             )
 
             messagebox.showinfo(
@@ -1901,7 +2233,7 @@ class FoxApp(tk.Tk):
                 "Password protection removed."
             )
 
-        except Exception:
+        except ValueError as exc:
 
             self.set_status(
 
@@ -1913,7 +2245,20 @@ class FoxApp(tk.Tk):
 
                 "FOX // ACCESS DENIED",
 
-                "Wrong password or corrupted file."
+                str(exc)
+            )
+
+        except Exception as exc:
+
+            self.set_status(
+                "ERROR // PASSWORD NOT REMOVED"
+            )
+
+            messagebox.showerror(
+
+                "FOX // ERROR",
+
+                str(exc)
             )
 
 
@@ -1935,9 +2280,14 @@ class FoxApp(tk.Tk):
 
             "• AES-256-GCM encryption\n"
             "• PBKDF2 password derivation\n"
+            "• Locks both individual files and entire folders\n"
             "• Optional password hints\n"
             "• Windows Administrator/UAC\n"
             "• System Tray background mode\n\n"
+
+            "Locked files and folders stay locked using only their own "
+            "contents - no background process is required, so they "
+            "remain protected even while FOX is completely closed.\n\n"
 
             "Closing the window does not terminate FOX.\n"
 
