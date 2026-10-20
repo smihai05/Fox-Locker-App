@@ -1,4 +1,4 @@
-# FOX // Watchdog Node
+# FOX // A Work in progress app, needs more polish
 
 A small Windows desktop app for password-protecting individual files or entire
 folders in place, using AES-256-GCM. Locked items stay locked using only their
@@ -76,3 +76,7 @@ The output executable is written to `dist\fox.exe`.
   processing very large files or folders — this is expected.
 - There is no password recovery. If you forget the password, the file or
   folder cannot be restored.
+
+
+## License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
